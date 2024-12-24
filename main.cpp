@@ -58,6 +58,7 @@ using u32 = uint32_t;
 using u16 = uint16_t;
 using u8 = uint8_t;
 
+using i64 = int64_t;
 using i32 = int32_t;
 using i16 = int16_t;
 
@@ -841,7 +842,7 @@ public:
 constexpr i16 inputQuantizationValue = 255;
 constexpr i16 hiddenQuantizationValue = 64;
 constexpr i16 evalScale = 400;
-constexpr size_t HL_SIZE = 32;
+constexpr size_t HL_SIZE = 384;
 
 
 using Accumulator = array<i16, HL_SIZE>;
@@ -856,12 +857,13 @@ public:
     array<i16, HL_SIZE * 2> weightsToOut;
     i16 outputBias;
 
-    void CReLU(i16& x) {
+    i32 SCReLU(i16 x) {
         if (x < 0) x = 0;
         else if (x > inputQuantizationValue) x = inputQuantizationValue;
+        return x * x;
     }
 
-    int feature(Color perspective, Color color, PieceType piece, Square square) {
+    static int feature(Color perspective, Color color, PieceType piece, Square square) {
         // Constructs a feature from the given perspective for a piece
         // of the given type and color on the given square
 
@@ -968,6 +970,9 @@ public:
     std::vector<u64> positionHistory;
     u64 zobrist;
 
+    Accumulator whiteAccum;
+    Accumulator blackAccum;
+
     void reset() {
         // Reset position
         white[0] = 0xFF00ULL;
@@ -997,6 +1002,7 @@ public:
         recompute();
         updateCheckPin();
         updateZobrist();
+        updateAccum();
     }
 
     void clearIndex(int index) {
@@ -1014,6 +1020,26 @@ public:
         black[3] &= mask;
         black[4] &= mask;
         black[5] &= mask;
+    }
+
+    void clearIndex(const Color c, int index) {
+        const u64 mask = ~(1ULL << index);
+        if (c) {
+            white[0] &= mask;
+            white[1] &= mask;
+            white[2] &= mask;
+            white[3] &= mask;
+            white[4] &= mask;
+            white[5] &= mask;
+        }
+        else {
+            black[0] &= mask;
+            black[1] &= mask;
+            black[2] &= mask;
+            black[3] &= mask;
+            black[4] &= mask;
+            black[5] &= mask;
+        }
     }
 
     void recompute() {
@@ -1588,6 +1614,56 @@ public:
         cout << "Current key: 0x" << std::hex << std::uppercase << zobrist << std::dec << endl;
     }
 
+    void placePiece(Color c, int pt, int square) {
+        auto& us = c ? white : black;
+        
+        setBit(us[pt], square, 1);
+        zobrist ^= Precomputed::zobrist[c][pt][square];
+
+        // Extract the feature
+        int inputFeatureWhite = NNUE::feature(WHITE, c, PieceType(pt), Square(square));
+        int inputFeatureBlack = NNUE::feature(BLACK, c, PieceType(pt), Square(square));
+
+        // Accumulate weights in the hidden layer
+        for (int i = 0; i < HL_SIZE; i++) {
+            whiteAccum[i] += nn.weightsToHL[inputFeatureWhite * HL_SIZE + i];
+            blackAccum[i] += nn.weightsToHL[inputFeatureBlack * HL_SIZE + i];
+        }
+    }
+
+    void removePiece(Color c, int pt, int square) {
+        auto& us = c ? white : black;
+        zobrist ^= Precomputed::zobrist[c][pt][square];
+
+        // Extract the feature
+        int inputFeatureWhite = NNUE::feature(WHITE, c, getPiece(square), Square(square));
+        int inputFeatureBlack = NNUE::feature(BLACK, c, getPiece(square), Square(square));
+
+        // Accumulate weights in the hidden layer
+        for (int i = 0; i < HL_SIZE; i++) {
+            whiteAccum[i] -= nn.weightsToHL[inputFeatureWhite * HL_SIZE + i];
+            blackAccum[i] -= nn.weightsToHL[inputFeatureBlack * HL_SIZE + i];
+        }
+
+        setBit(us[pt], square, 0);
+    }
+
+    void removePiece(Color c, int square) {
+        zobrist ^= Precomputed::zobrist[c][getPiece(square)][square];
+
+        // Extract the feature
+        int inputFeatureWhite = NNUE::feature(WHITE, c, getPiece(square), Square(square));
+        int inputFeatureBlack = NNUE::feature(BLACK, c, getPiece(square), Square(square));
+
+        // Accumulate weights in the hidden layer
+        for (int i = 0; i < HL_SIZE; i++) {
+            whiteAccum[i] -= nn.weightsToHL[inputFeatureWhite * HL_SIZE + i];
+            blackAccum[i] -= nn.weightsToHL[inputFeatureBlack * HL_SIZE + i];
+        }
+
+        clearIndex(c, square);
+    }
+
     void move(string& moveIn) {
         move(Move(moveIn, *this));
     }
@@ -1611,86 +1687,65 @@ public:
 
         for (int i = 0; i < 6; ++i) {
             if (readBit(us[i], from)) {
-                zobrist ^= Precomputed::zobrist[side][i][from];
-
                 MoveType mt = moveIn.typeOf();
 
-                // Increment endbit only if the move is not a promo, otherwise it is handled in the big switch
-                if ((mt & 0x1000) == 0) {
-                    zobrist ^= Precomputed::zobrist[side][i][to];
-                }
-
-                setBit(us[i], from, 0);
+                removePiece(side, i, from);
                 IFDBG m_assert(!readBit(us[i], from), "Position piece moved from was not cleared");
 
                 enPassant = 0;
 
                 switch (mt) {
-                case STANDARD_MOVE: setBit(us[i], to, 1); break;
+                case STANDARD_MOVE: placePiece(side, i, to); break;
                 case DOUBLE_PUSH:
-                    setBit(us[0], to, 1);
+                    placePiece(side, i, to);
                     enPassant = 1ULL << ((side) * (from + 8) + (!side) * (from - 8));
                     break;
                 case CASTLE_K:
                     if (from == e1 && to == g1 && readBit(castlingRights, 3)) {
-                        setBit(us[i], to, 1);
-                        setBit(us[3], h1, 0); // Remove rook
+                        placePiece(side, i, to);
 
-                        setBit(us[3], f1, 1); // Set rook
-
-                        zobrist ^= Precomputed::zobrist[side][3][h1];
-                        zobrist ^= Precomputed::zobrist[side][3][f1];
+                        removePiece(side, ROOK, h1);
+                        placePiece(side, ROOK, f1);
                     }
                     else if (from == e8 && to == g8 && readBit(castlingRights, 1)) {
-                        setBit(us[i], to, 1);
-                        setBit(us[3], h8, 0); // Remove rook
+                        placePiece(side, i, to);
 
-                        setBit(us[3], f8, 1); // Set rook
-
-                        zobrist ^= Precomputed::zobrist[side][3][h8];
-                        zobrist ^= Precomputed::zobrist[side][3][f8];
+                        removePiece(side, ROOK, h8);
+                        placePiece(side, ROOK, f8);
                     }
                     break;
                 case CASTLE_Q:
                     if (to == c1 && readBit(castlingRights, 2)) {
-                        setBit(us[i], to, 1);
-                        setBit(us[3], a1, 0); // Remove rook
+                        placePiece(side, i, to);
 
-                        setBit(us[3], d1, 1); // Set rook
-
-                        zobrist ^= Precomputed::zobrist[side][3][a1];
-                        zobrist ^= Precomputed::zobrist[side][3][d1];
+                        removePiece(side, ROOK, a1);
+                        placePiece(side, ROOK, d1);
                     }
                     else if (to == c8 && readBit(castlingRights, 0)) {
-                        setBit(us[i], to, 1);
-                        setBit(us[3], a8, 0); // Remove rook
+                        placePiece(side, i, to);
 
-                        setBit(us[3], d8, 1); // Set rook
-
-                        zobrist ^= Precomputed::zobrist[side][3][a8];
-                        zobrist ^= Precomputed::zobrist[side][3][d8];
+                        removePiece(side, ROOK, a8);
+                        placePiece(side, ROOK, d8);
                     }
                     break;
-                case CAPTURE: zobrist ^= Precomputed::zobrist[~side][getPiece(to)][to]; clearIndex(to); setBit(us[i], to, 1); break;
-                case QUEEN_PROMO_CAPTURE: zobrist ^= Precomputed::zobrist[~side][getPiece(to)][to]; zobrist ^= Precomputed::zobrist[side][4][to]; clearIndex(to); setBit(us[4], to, 1); break;
-                case ROOK_PROMO_CAPTURE: zobrist ^= Precomputed::zobrist[~side][getPiece(to)][to]; zobrist ^= Precomputed::zobrist[side][3][to]; clearIndex(to); setBit(us[3], to, 1); break;
-                case BISHOP_PROMO_CAPTURE: zobrist ^= Precomputed::zobrist[~side][getPiece(to)][to]; zobrist ^= Precomputed::zobrist[side][2][to]; clearIndex(to); setBit(us[2], to, 1); break;
-                case KNIGHT_PROMO_CAPTURE: zobrist ^= Precomputed::zobrist[~side][getPiece(to)][to]; zobrist ^= Precomputed::zobrist[side][1][to]; clearIndex(to); setBit(us[1], to, 1); break;
+                case CAPTURE: removePiece(~side, to); placePiece(side, i, to); break;
+                case QUEEN_PROMO_CAPTURE: removePiece(~side, to); placePiece(side, QUEEN, to); break;
+                case ROOK_PROMO_CAPTURE: removePiece(~side, to); placePiece(side, ROOK, to); break;
+                case BISHOP_PROMO_CAPTURE: removePiece(~side, to); placePiece(side, BISHOP, to); break;
+                case KNIGHT_PROMO_CAPTURE: removePiece(~side, to); placePiece(side, KNIGHT, to); break;
                 case EN_PASSANT:
                     if (side) {
-                        setBit(black[0], to + shifts::SOUTH, 0);
-                        zobrist ^= Precomputed::zobrist[~side][0][to + shifts::SOUTH];
+                        removePiece(BLACK, PAWN, to + shifts::SOUTH);
                     }
                     else {
-                        setBit(white[0], to + shifts::NORTH, 0);
-                        zobrist ^= Precomputed::zobrist[~side][0][to + shifts::NORTH];
+                        removePiece(WHITE, PAWN, to + shifts::NORTH);
                     }
-                    setBit(us[i], to, 1);
+                    placePiece(side, PAWN, to);
                     break;
-                case QUEEN_PROMO: setBit(us[4], to, 1); zobrist ^= Precomputed::zobrist[side][4][to]; break;
-                case ROOK_PROMO: setBit(us[3], to, 1); zobrist ^= Precomputed::zobrist[side][3][to]; break;
-                case BISHOP_PROMO: setBit(us[2], to, 1); zobrist ^= Precomputed::zobrist[side][2][to]; break;
-                case KNIGHT_PROMO: setBit(us[1], to, 1); zobrist ^= Precomputed::zobrist[side][1][to]; break;
+                case QUEEN_PROMO: placePiece(side, QUEEN, to); break;
+                case ROOK_PROMO: placePiece(side, ROOK, to); break;
+                case BISHOP_PROMO: placePiece(side, BISHOP, to); break;
+                case KNIGHT_PROMO: placePiece(side, KNIGHT, to); break;
                 }
 
                 // Halfmove clock, promo and set en passant
@@ -1807,6 +1862,7 @@ public:
         recompute();
         updateCheckPin();
         updateZobrist();
+        updateAccum();
     }
 
     string exportToFEN() {
@@ -1911,14 +1967,57 @@ public:
 
         eval = whitePieces - blackPieces;
 
-        // Only utilize the NNUE in situations when eval isn't very strong
+        // Only utilize the NNUE in situations when game isn't very won or lsot
         // Concept from SF
         if (std::abs(eval) < 950) {
-            eval = nn.forwardPass(this);
+            return nn.forwardPass(this);
         }
 
         // Adjust evaluation for the side to move
         return (side) ? eval : -eval;
+    }
+
+    void updateAccum() {
+        // This code assumes white is the STM
+        u64 whitePieces = this->whitePieces;
+        u64 blackPieces = this->blackPieces;
+
+        blackAccum = nn.hiddenLayerBias;
+        whiteAccum = nn.hiddenLayerBias;
+
+        // Accumulate contributions for STM pieces
+        while (whitePieces) {
+            Square currentSq = Square(ctzll(whitePieces)); // Find the least significant set bit
+
+            // Extract the feature for STM
+            int inputFeatureWhite = NNUE::feature(WHITE, WHITE, getPiece(currentSq), currentSq);
+            int inputFeatureBlack = NNUE::feature(BLACK, WHITE, getPiece(currentSq), currentSq);
+
+            // Accumulate weights for STM hidden layer
+            for (int i = 0; i < HL_SIZE; i++) {
+                whiteAccum[i] += nn.weightsToHL[inputFeatureWhite * HL_SIZE + i];
+                blackAccum[i] += nn.weightsToHL[inputFeatureBlack * HL_SIZE + i];
+            }
+
+            whitePieces &= (whitePieces - 1); // Clear the least significant set bit
+        }
+
+        // Accumulate contributions for OPP pieces
+        while (blackPieces) {
+            Square currentSq = Square(ctzll(blackPieces)); // Find the least significant set bit
+
+            // Extract the feature for STM
+            int inputFeatureWhite = NNUE::feature(WHITE, BLACK, getPiece(currentSq), currentSq);
+            int inputFeatureBlack = NNUE::feature(BLACK, BLACK, getPiece(currentSq), currentSq);
+
+            // Accumulate weights for STM hidden layer
+            for (int i = 0; i < HL_SIZE; i++) {
+                whiteAccum[i] += nn.weightsToHL[inputFeatureWhite * HL_SIZE + i];
+                blackAccum[i] += nn.weightsToHL[inputFeatureBlack * HL_SIZE + i];
+            }
+
+            blackPieces &= (blackPieces - 1); // Clear the least significant set bit
+        }
     }
 
     void updateZobrist() {
@@ -1955,88 +2054,30 @@ public:
 
 // Returns the output of the NN
 int NNUE::forwardPass(Board* board) {
-    // Temporary accumulators for hidden layer sums for STM and OPP perspectives
-    Accumulator accumulatorSTM;
-    Accumulator accumulatorOPP;
-    accumulatorSTM.fill(0);
-    accumulatorOPP.fill(0);
-
     // Determine the side to move and the opposite side
     Color stm = board->side;
-    Color opp = ~stm;
-
-    // Bitboards for STM and OPP pieces
-    u64 stmPieces = stm ? board->whitePieces : board->blackPieces;
-    u64 oppPieces = ~stm ? board->whitePieces : board->blackPieces;
-
-    // Accumulate contributions for STM pieces
-    while (stmPieces) {
-        Square currentSq = Square(ctzll(stmPieces)); // Find the least significant set bit
-
-        // Extract the feature for STM
-        int inputFeatureSTM = feature(stm, stm, board->getPiece(currentSq), currentSq);
-        int inputFeatureOPP = feature(opp, stm, board->getPiece(currentSq), currentSq);
-
-        // Accumulate weights for STM hidden layer
-        for (int i = 0; i < HL_SIZE; i++) {
-            accumulatorSTM[i] += weightsToHL[inputFeatureSTM * HL_SIZE + i];
-            accumulatorOPP[i] += weightsToHL[inputFeatureOPP * HL_SIZE + i];
-        }
-
-        stmPieces &= (stmPieces - 1); // Clear the least significant set bit
-    }
-
-    // Accumulate contributions for OPP pieces
-    while (oppPieces) {
-        Square currentSq = Square(ctzll(oppPieces)); // Find the least significant set bit
-
-        // Extract the feature for STM
-        int inputFeatureSTM = feature(stm, opp, board->getPiece(currentSq), currentSq);
-        int inputFeatureOPP = feature(opp, opp, board->getPiece(currentSq), currentSq);
-
-        // Accumulate weights for STM hidden layer
-        for (int i = 0; i < HL_SIZE; i++) {
-            accumulatorSTM[i] += weightsToHL[inputFeatureSTM * HL_SIZE + i];
-            accumulatorOPP[i] += weightsToHL[inputFeatureOPP * HL_SIZE + i];
-        }
-
-        oppPieces &= (oppPieces - 1); // Clear the least significant set bit
-    }
-
-    // Define hidden layers for STM and OPP
-    Accumulator hiddenLayerSTM;
-    Accumulator hiddenLayerOPP;
-
-    // Apply bias and activation (CReLU) to STM hidden layer
-    for (int i = 0; i < HL_SIZE; i++) {
-        hiddenLayerSTM[i] = accumulatorSTM[i] + hiddenLayerBias[i];
-        CReLU(hiddenLayerSTM[i]);
-    }
-
-    // Apply bias and activation (CReLU) to OPP hidden layer
-    for (int i = 0; i < HL_SIZE; i++) {
-        hiddenLayerOPP[i] = accumulatorOPP[i] + hiddenLayerBias[i];
-        CReLU(hiddenLayerOPP[i]);
-    }
+    
+    Accumulator& accumulatorSTM = stm ? board->whiteAccum : board->blackAccum;
+    Accumulator& accumulatorOPP = ~stm ? board->whiteAccum : board->blackAccum;
 
     // Accumulate output for STM and OPP using separate weight segments
-    int outputSTM = 0;
-    int outputOPP = 0;
+    i64 eval = 0;
+
     for (int i = 0; i < HL_SIZE; i++) {
         // First HL_SIZE weights are for STM
-        outputSTM += hiddenLayerSTM[i] * weightsToOut[i];
+        eval += SCReLU(accumulatorSTM[i]) * weightsToOut[i];
 
         // Last HL_SIZE weights are for OPP
-        outputOPP += hiddenLayerOPP[i] * weightsToOut[HL_SIZE + i];
+        eval += SCReLU(accumulatorOPP[i]) * weightsToOut[HL_SIZE + i];
     }
 
-    // Combine STM and OPP outputs
-    int combinedOutput = outputSTM + outputOPP;
+    // Dequantization
+    eval /= inputQuantizationValue;
 
-    combinedOutput += outputBias;
+    eval += outputBias;
 
     // Apply output bias and scale the result
-    return (combinedOutput * evalScale) / (inputQuantizationValue * hiddenQuantizationValue);
+    return (eval * evalScale) / (inputQuantizationValue * hiddenQuantizationValue);
 }
 
 
@@ -2296,9 +2337,6 @@ static MoveEvaluation _qs(Board& board,
     }
 
     if (board.isDraw()) {
-        if (board.isInCheck(board.side)) {
-            return { Move(), -999999 };
-        }
         return { Move(), 0 };
     }
 
@@ -2371,9 +2409,6 @@ static MoveEvaluation go(Board& board,
             return { Move(), eval };
         }
         else if (board.isDraw()) {
-            if (board.isInCheck(board.side)) {
-                return { Move(), -999999 };
-            }
             return { Move(), 0 };
         }
     }
@@ -2453,7 +2488,7 @@ static MoveEvaluation go(Board& board,
                 }
                 double elapsedMs = (double)std::chrono::duration_cast<std::chrono::milliseconds>(now - timerStart).count();
                 int nps = (int)((double)nodes / (elapsedMs / 1000));
-                cout << "info depth " << depth << " nodes " << nodes << " nps " << nps << " hashfull " << (int)(TTused / (double)TT.size * 1000) << " currmove " << m.toString() << " currmovenumber " << movesMade << endl;
+                cout << "info depth " << depth << " nodes " << nodes << " nps " << nps << " time " << std::to_string((int)elapsedMs) << " hashfull " << (int)(TTused / (double)TT.size * 1000) << " currmove " << m.toString() << endl;
             }
         }
     }
@@ -2497,13 +2532,12 @@ void iterativeDeepening(
     auto start = std::chrono::steady_clock::now();
     std::string bestMoveAlgebra = "";
     if (wtime || btime) {
-        timeToSpend = board.side ? wtime / 2 : btime / 2;
-        int inc = board.side ? winc : binc;
-        softLimit = 0.6 * ((timeToSpend * 2) / movesToGo + inc * 3 / 4);
+        timeToSpend = board.side ? wtime / movesToGo : btime / movesToGo;
+        softLimit = timeToSpend * 0.65;
     }
     else if (mtime) {
         timeToSpend = mtime;
-        softLimit = mtime;
+        softLimit = timeToSpend;
     }
 
     // timeToSpend is a hard limit
@@ -2514,12 +2548,15 @@ void iterativeDeepening(
         else maxDepth = 1;
     }
 
-    softLimit = std::min(softLimit, timeToSpend);
-
     MoveEvaluation move;
     MoveEvaluation bestMove;
 
     IFDBG m_assert(maxDepth >= 1, "Depth is less than 1 in ID search");
+
+    // Cap the depth to 255
+    maxDepth = std::min(255, maxDepth);
+
+    softLimit = std::min(softLimit, timeToSpend);
 
     for (int depth = 1; depth <= maxDepth; depth++) {
         move = go(board, depth, breakFlag, start, timeToSpend, -INF_INT, INF_INT, maxNodes, true);
@@ -2542,7 +2579,7 @@ void iterativeDeepening(
             if (TT.getEntry(i)->zobristKey != 0) TTused++;
         }
 
-        string ans = "info depth " + std::to_string(depth) + " nodes " + std::to_string(nodes) + " nps " + std::to_string(nps) + " hashfull " + std::to_string((int)(TTused / (double)TT.size * 1000));
+        string ans = "info depth " + std::to_string(depth) + " nodes " + std::to_string(nodes) + " nps " + std::to_string(nps) + " time " + std::to_string((int)(elapsedNs/1e6)) +  " hashfull " + std::to_string((int)(TTused / (double)TT.size * 1000));
 
         if (std::abs(bestMove.eval) >= 90000) {
             // Assume large positive value is mate
@@ -2585,14 +2622,14 @@ void iterativeDeepening(
 
 
 int main() {
-    Precomputed::compute();
-    initializeAllDatabases();
     string command;
     std::deque<string> parsedcommand;
     Board currentPos;
+    Precomputed::compute();
+    initializeAllDatabases();
+    nn.loadNet("C:\\Users\\qitag\\Downloads\\simple(2).nnue");
     currentPos.reset();
     std::atomic<bool> breakFlag(false);
-    nn.loadNet("C:\\Users\\qitag\\Downloads\\32.nnue");
     std::optional<std::thread> searchThreadOpt;
     cout << "Prelude ready and awaiting commands" << endl;
     while (true) {
@@ -2769,7 +2806,7 @@ int main() {
             }
         }
         else if (command == "debug.eval") {
-            cout << "Evaluation (centipawns as currenet side): " << currentPos.evaluate() << endl;
+            cout << "Evaluation (centipawns as current side): " << currentPos.evaluate() << endl;
         }
         else if (command == "debug.popcnt") {
             cout << "White pawns: " << popcountll(currentPos.white[0]) << endl;
